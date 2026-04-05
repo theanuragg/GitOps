@@ -1,0 +1,289 @@
+# .github/workflows/promote.yaml
+#
+# IMAGE PROMOTION PIPELINE
+# ═══════════════════════════════════════════════════════════════════════════
+# This pipeline handles the full GitOps promotion lifecycle:
+#
+#   PR merge → build → dev deploy → staging promote → prod promote
+#
+# Key design decisions:
+#   - Images are built ONCE and promoted (no rebuilds per env)
+#   - Image tag = git SHA (immutable, traceable)
+#   - Promotion = updating the image tag in the overlay kustomization
+#   - ArgoCD detects the Git change and syncs automatically
+#   - Prod promotion requires manual approval via GitHub Environments
+#   - Security scanning (Trivy) gates promotion to staging
+# ═══════════════════════════════════════════════════════════════════════════
+
+name: Build & Promote
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'Dockerfile'
+      - '.github/workflows/promote.yaml'
+
+  # Allow manual promotion trigger (e.g., emergency hotfix)
+  workflow_dispatch:
+    inputs:
+      target_env:
+        description: "Target environment"
+        required: true
+        type: choice
+        options: [staging, prod]
+      image_tag:
+        description: "Image tag to promote (e.g., sha-abc1234)"
+        required: true
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/api-service
+  # Repo bot credentials (stored as org secrets)
+  GIT_USER_NAME: "platform-bot"
+  GIT_USER_EMAIL: "platform-bot@example.com"
+
+jobs:
+  # ── Job 1: Build & Push ─────────────────────────────────────────────────
+  build:
+    name: Build & Push Image
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write    # Required for OIDC/cosign signing
+      security-events: write
+
+    outputs:
+      image_tag: ${{ steps.meta.outputs.tags }}
+      short_sha: ${{ steps.sha.outputs.short }}
+      image_digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get short SHA
+        id: sha
+        run: echo "short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          # Use containerd image store for better caching
+          driver-opts: image=moby/buildkit:master
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,prefix=sha-,format=short
+            type=ref,event=branch
+            # Semver tags from git tags (triggers prod promotions)
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Cache from GHCR (layer caching across builds)
+          cache-from: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache
+          cache-to: type=registry,ref=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:buildcache,mode=max
+          # Build provenance attestation (SLSA Level 3)
+          provenance: true
+          sbom: true   # Generate SBOM and attach to image
+
+      - name: Sign image with cosign (keyless)
+        # Sign using GitHub OIDC — no key management needed
+        uses: sigstore/cosign-installer@v3
+      - run: |
+          cosign sign --yes \
+            "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${{ steps.build.outputs.digest }}"
+
+  # ── Job 2: Security Scan ─────────────────────────────────────────────────
+  scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: build
+    permissions:
+      security-events: write
+
+    steps:
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ needs.build.outputs.short_sha }}"
+          format: sarif
+          output: trivy-results.sarif
+          # CRITICAL: Block on HIGH and CRITICAL CVEs
+          severity: "CRITICAL,HIGH"
+          exit-code: "1"   # Fail the job (blocks promotion)
+          ignore-unfixed: true   # Ignore CVEs with no fix available
+
+      - name: Upload Trivy results to GitHub Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+
+      - name: Scan IaC with Checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: apps/
+          framework: kubernetes
+          soft_fail: false
+          output_format: sarif
+          output_file_path: checkov-results.sarif
+
+  # ── Job 3: Deploy to Dev ─────────────────────────────────────────────────
+  deploy-dev:
+    name: Deploy to Dev
+    runs-on: ubuntu-latest
+    needs: [build, scan]
+    environment: dev   # GitHub Environment (no approval needed for dev)
+
+    steps:
+      - name: Checkout gitops repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PLATFORM_BOT_TOKEN }}
+          ref: main
+
+      - name: Update dev image tag
+        run: |
+          NEW_TAG="sha-${{ needs.build.outputs.short_sha }}"
+
+          # Use kustomize to update the image tag (not sed — more reliable)
+          cd apps/overlays/dev
+          kustomize edit set image \
+            ghcr.io/${{ env.IMAGE_NAME }}=${REGISTRY}/${IMAGE_NAME}:${NEW_TAG}
+
+          echo "Updated dev to: $NEW_TAG"
+
+      - name: Commit and push
+        run: |
+          git config user.name  "${{ env.GIT_USER_NAME }}"
+          git config user.email "${{ env.GIT_USER_EMAIL }}"
+
+          git add apps/overlays/dev/kustomization.yaml
+          git commit -m "chore(dev): promote api-service to sha-${{ needs.build.outputs.short_sha }}
+
+          Build: ${{ github.run_id }}
+          Commit: ${{ github.sha }}
+          Author: ${{ github.actor }}"
+
+          git push origin main
+
+      - name: Wait for ArgoCD sync
+        # Poll ArgoCD API until the app reports Synced + Healthy
+        run: |
+          ./scripts/wait-for-argocd.sh \
+            --app api-service-dev \
+            --timeout 300 \
+            --argocd-url https://argocd.internal.example.com \
+            --auth-token ${{ secrets.ARGOCD_AUTH_TOKEN }}
+
+  # ── Job 4: Promote to Staging ─────────────────────────────────────────────
+  promote-staging:
+    name: Promote to Staging
+    runs-on: ubuntu-latest
+    needs: [build, deploy-dev]
+    environment: staging   # No approval but deploys after dev succeeds
+
+    steps:
+      - name: Checkout gitops repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PLATFORM_BOT_TOKEN }}
+          ref: main
+
+      - name: Promote image to staging
+        run: |
+          NEW_TAG="sha-${{ needs.build.outputs.short_sha }}"
+
+          cd apps/overlays/staging
+          kustomize edit set image \
+            ghcr.io/${{ env.IMAGE_NAME }}=${REGISTRY}/${IMAGE_NAME}:${NEW_TAG}
+
+      - name: Commit and push
+        run: |
+          git config user.name  "${{ env.GIT_USER_NAME }}"
+          git config user.email "${{ env.GIT_USER_EMAIL }}"
+
+          git add apps/overlays/staging/kustomization.yaml
+          git commit -m "chore(staging): promote api-service to sha-${{ needs.build.outputs.short_sha }}"
+          git push origin main
+
+      - name: Run integration tests against staging
+        run: |
+          # Wait for staging to be ready
+          ./scripts/wait-for-argocd.sh \
+            --app api-service-staging \
+            --timeout 300
+
+          # Run your integration test suite
+          npm run test:integration -- --env=staging
+        env:
+          STAGING_URL: https://api-staging.internal.example.com
+          API_KEY: ${{ secrets.STAGING_API_KEY }}
+
+  # ── Job 5: Promote to Production (Manual Approval) ────────────────────────
+  promote-prod:
+    name: Promote to Production
+    runs-on: ubuntu-latest
+    needs: [build, promote-staging]
+    # GitHub Environment with required reviewers — blocks here until approved
+    environment: production
+
+    steps:
+      - name: Checkout gitops repo
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.PLATFORM_BOT_TOKEN }}
+          ref: main
+
+      - name: Promote image to production
+        run: |
+          NEW_TAG="sha-${{ needs.build.outputs.short_sha }}"
+
+          cd apps/overlays/prod
+          kustomize edit set image \
+            ghcr.io/${{ env.IMAGE_NAME }}=${REGISTRY}/${IMAGE_NAME}:${NEW_TAG}
+
+      - name: Commit and push
+        run: |
+          git config user.name  "${{ env.GIT_USER_NAME }}"
+          git config user.email "${{ env.GIT_USER_EMAIL }}"
+
+          git add apps/overlays/prod/kustomization.yaml
+          git commit -m "feat(prod): promote api-service to sha-${{ needs.build.outputs.short_sha }}
+
+          Approved by: ${{ github.actor }}
+          Run: ${{ github.run_id }}
+          SHA: ${{ github.sha }}"
+
+          git push origin main
+
+      - name: Monitor canary rollout
+        # Watch the Argo Rollout progress
+        run: |
+          ./scripts/wait-for-rollout.sh \
+            --name api-service \
+            --namespace api-service \
+            --context prod-cluster \
+            --timeout 1800   # 30 min max for canary
