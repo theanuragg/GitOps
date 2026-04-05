@@ -1,0 +1,118 @@
+# apps/overlays/prod/kustomization.yaml
+#
+# PRODUCTION OVERLAY
+# ═══════════════════════════════════════════════════════════════════════════
+# Patches the base with production-specific values:
+#   - Higher replica counts
+#   - Stricter resource limits
+#   - Pinned image tag (never "latest" in prod)
+#   - Restricted PodSecurity labels
+#   - Production Ingress with real TLS cert
+# ═══════════════════════════════════════════════════════════════════════════
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: api-service
+
+# Inherit everything from the base
+bases:
+  - ../../base
+
+# Pin the production image tag
+# ArgoCD Image Updater will commit updates to this field
+images:
+  - name: ghcr.io/YOUR_ORG/api-service
+    newTag: v1.4.2   # Updated by ArgoCD Image Updater via Git commit
+
+# Inject environment label across all resources
+commonLabels:
+  environment: prod
+
+commonAnnotations:
+  app.kubernetes.io/environment: prod
+
+# Production-specific patches
+patches:
+  # ── Deployment: more replicas, stricter limits ────────────────────────────
+  - target:
+      kind: Deployment
+      name: api-service
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 4
+
+      - op: replace
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            cpu: 200m
+            memory: 512Mi
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+
+      # Enforce restricted pod security in prod
+      - op: replace
+        path: /spec/template/spec/securityContext
+        value:
+          runAsNonRoot: true
+          runAsUser: 1000
+          runAsGroup: 1000
+          fsGroup: 1000
+          seccompProfile:
+            type: RuntimeDefault
+          sysctls: []
+
+  # ── HPA: higher max replicas for prod traffic ─────────────────────────────
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: api-service
+    patch: |-
+      - op: replace
+        path: /spec/maxReplicas
+        value: 20
+
+      - op: replace
+        path: /spec/minReplicas
+        value: 4
+
+  # ── PDB: stricter disruption budget ──────────────────────────────────────
+  - target:
+      kind: PodDisruptionBudget
+      name: api-service
+    patch: |-
+      - op: replace
+        path: /spec/minAvailable
+        value: 3   # Always keep at least 3/4 pods up in prod
+
+  # ── Namespace: restricted pod security (baseline → restricted) ────────────
+  - target:
+      kind: Namespace
+      name: api-service
+    patch: |-
+      - op: replace
+        path: /metadata/labels/pod-security.kubernetes.io~1enforce
+        value: restricted
+      - op: replace
+        path: /metadata/labels/pod-security.kubernetes.io~1warn
+        value: restricted
+
+# Additional prod-only resources
+resources:
+  - ingress.yaml
+  - rollout.yaml      # Argo Rollouts for canary deployments in prod
+
+# ConfigMap with prod-specific config (non-secret values only)
+configMapGenerator:
+  - name: api-service-config
+    literals:
+      - APP_ENV=production
+      - LOG_LEVEL=info
+      - LOG_FORMAT=json
+      - ENABLE_PPROF=false    # Never expose pprof in prod
+      - CACHE_TTL=300s
+      - DB_MAX_CONNECTIONS=50
+      - DB_MAX_IDLE_CONNECTIONS=10
+    options:
+      disableNameSuffixHash: true   # Stable name so Deployment doesn't restart on every build

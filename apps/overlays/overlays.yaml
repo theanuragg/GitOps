@@ -1,0 +1,149 @@
+# apps/overlays/dev/kustomization.yaml
+#
+# DEV OVERLAY — optimised for fast iteration
+# Lower resource requests, fewer replicas, debug features enabled
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: api-service
+bases:
+  - ../../base
+
+images:
+  - name: ghcr.io/YOUR_ORG/api-service
+    newTag: main-latest   # Image Updater tracks :main-* semver in dev
+
+commonLabels:
+  environment: dev
+
+patches:
+  # Fewer replicas in dev (save cost)
+  - target:
+      kind: Deployment
+      name: api-service
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 1
+
+      # Smaller resource requests (shared dev cluster)
+      - op: replace
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+          limits:
+            cpu: 200m
+            memory: 256Mi
+
+  # HPA: scale from 1–3 in dev
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: api-service
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 1
+      - op: replace
+        path: /spec/maxReplicas
+        value: 3
+
+  # PDB: no strict budget in dev
+  - target:
+      kind: PodDisruptionBudget
+      name: api-service
+    patch: |-
+      - op: replace
+        path: /spec/minAvailable
+        value: 0
+
+configMapGenerator:
+  - name: api-service-config
+    literals:
+      - APP_ENV=development
+      - LOG_LEVEL=debug
+      - LOG_FORMAT=pretty
+      - ENABLE_PPROF=true     # Allow profiling in dev
+      - CACHE_TTL=10s
+      - DB_MAX_CONNECTIONS=5
+      - DB_MAX_IDLE_CONNECTIONS=2
+    options:
+      disableNameSuffixHash: true
+
+resources:
+  - ingress.yaml
+
+---
+# ─────────────────────────────────────────────────────────────────────────────
+# apps/overlays/staging/kustomization.yaml
+#
+# STAGING OVERLAY — production mirror for validation
+# Same replica count and limits as prod; slightly relaxed sync policy
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: api-service
+bases:
+  - ../../base
+
+images:
+  - name: ghcr.io/YOUR_ORG/api-service
+    newTag: v1.4.2-rc.1   # Release candidate — promoted from dev via CI
+
+commonLabels:
+  environment: staging
+
+patches:
+  - target:
+      kind: Deployment
+      name: api-service
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 2
+
+      - op: replace
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            cpu: 200m
+            memory: 512Mi
+          limits:
+            cpu: 1000m
+            memory: 1Gi
+
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: api-service
+    patch: |-
+      - op: replace
+        path: /spec/minReplicas
+        value: 2
+      - op: replace
+        path: /spec/maxReplicas
+        value: 8
+
+  - target:
+      kind: PodDisruptionBudget
+      name: api-service
+    patch: |-
+      - op: replace
+        path: /spec/minAvailable
+        value: 1
+
+configMapGenerator:
+  - name: api-service-config
+    literals:
+      - APP_ENV=staging
+      - LOG_LEVEL=info
+      - LOG_FORMAT=json
+      - ENABLE_PPROF=false
+      - CACHE_TTL=60s
+      - DB_MAX_CONNECTIONS=20
+      - DB_MAX_IDLE_CONNECTIONS=5
+    options:
+      disableNameSuffixHash: true
+
+resources:
+  - ingress.yaml

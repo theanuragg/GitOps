@@ -1,0 +1,106 @@
+# apps/overlays/prod/ingress.yaml
+#
+# Production Ingress — TLS via cert-manager + security headers
+# Uses two services: stable + canary (for Argo Rollouts traffic splitting)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-service-stable
+  namespace: api-service
+  labels:
+    app.kubernetes.io/name: api-service
+    environment: prod
+  annotations:
+    # TLS cert provisioned by cert-manager from letsencrypt-prod
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+
+    # Force HTTPS
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+
+    # Security headers (OWASP recommendations)
+    nginx.ingress.kubernetes.io/configuration-snippet: |
+      more_set_headers "Strict-Transport-Security: max-age=31536000; includeSubDomains; preload";
+      more_set_headers "X-Frame-Options: DENY";
+      more_set_headers "X-Content-Type-Options: nosniff";
+      more_set_headers "X-XSS-Protection: 1; mode=block";
+      more_set_headers "Referrer-Policy: strict-origin-when-cross-origin";
+      more_set_headers "Permissions-Policy: geolocation=(), microphone=(), camera=()";
+      more_set_headers "Content-Security-Policy: default-src 'self'; script-src 'self'; object-src 'none'";
+
+    # Rate limiting — protect API from abuse
+    nginx.ingress.kubernetes.io/limit-rps: "100"
+    nginx.ingress.kubernetes.io/limit-connections: "20"
+    nginx.ingress.kubernetes.io/limit-whitelist: "10.0.0.0/8"  # Internal traffic exempt
+
+    # Request size limit
+    nginx.ingress.kubernetes.io/proxy-body-size: "10m"
+
+    # Timeouts
+    nginx.ingress.kubernetes.io/proxy-connect-timeout: "10"
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+    nginx.ingress.kubernetes.io/proxy-send-timeout: "60"
+
+    # Enable CORS for approved origins
+    nginx.ingress.kubernetes.io/enable-cors: "true"
+    nginx.ingress.kubernetes.io/cors-allow-origin: "https://app.example.com"
+    nginx.ingress.kubernetes.io/cors-allow-methods: "GET, POST, PUT, DELETE, OPTIONS"
+    nginx.ingress.kubernetes.io/cors-allow-headers: "Authorization, Content-Type"
+
+    # Canary annotation — controlled by Argo Rollouts
+    nginx.ingress.kubernetes.io/canary: "false"
+
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - api.example.com
+      secretName: api-service-tls   # cert-manager creates this
+
+  rules:
+    - host: api.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api-service      # Stable service
+                port:
+                  name: http
+
+---
+# Canary ingress — Argo Rollouts manages traffic weight via nginx annotations
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-service-canary
+  namespace: api-service
+  labels:
+    app.kubernetes.io/name: api-service
+    environment: prod
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    # Mark as canary — Argo Rollouts patches nginx.ingress.kubernetes.io/canary-weight
+    nginx.ingress.kubernetes.io/canary: "true"
+    nginx.ingress.kubernetes.io/canary-weight: "0"   # Starts at 0; Rollout updates this
+
+spec:
+  ingressClassName: nginx
+  tls:
+    - hosts:
+        - api.example.com
+      secretName: api-service-tls
+
+  rules:
+    - host: api.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api-service-canary   # Canary service (created by Argo Rollouts)
+                port:
+                  name: http
