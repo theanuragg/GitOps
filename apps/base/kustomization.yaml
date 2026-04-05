@@ -1,0 +1,42 @@
+# apps/base/kustomization.yaml
+#
+# BASE LAYER — shared across all environments
+# ═══════════════════════════════════════════════════════════════════════════
+# Contains the canonical, environment-agnostic Kubernetes manifests.
+# Overlays patch this base with environment-specific values:
+#   - Replica counts
+#   - Resource limits
+#   - Image tags
+#   - Config values
+#
+# Never put secrets here. Use ExternalSecret resources instead.
+# ═══════════════════════════════════════════════════════════════════════════
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+# All resources that make up our example "api-service" application
+resources:
+  - namespace.yaml
+  - serviceaccount.yaml
+  - deployment.yaml
+  - service.yaml
+  - hpa.yaml
+  - pdb.yaml
+  - networkpolicy.yaml
+  - externalsecret.yaml
+  - servicemonitor.yaml
+
+# Common labels applied to ALL resources in this base
+commonLabels:
+  app.kubernetes.io/name: api-service
+  app.kubernetes.io/part-of: platform
+  app.kubernetes.io/managed-by: argocd
+
+# Common annotations
+commonAnnotations:
+  app.kubernetes.io/version: "1.0.0"
+
+# Image tag is overridden by ArgoCD Image Updater per environment
+images:
+  - name: ghcr.io/YOUR_ORG/api-service
+    newTag: latest  # Overridden by overlay / image updater
