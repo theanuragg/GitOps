@@ -1,0 +1,278 @@
+# infrastructure/monitoring/alertmanager-config.yaml
+#
+# ALERTMANAGER CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════
+# Routes alerts to the right team via the right channel with the right urgency.
+#
+# Routing tree:
+#   All alerts
+#   ├── severity=critical   → PagerDuty (immediate page)
+#   │   └── env=prod        → PagerDuty prod escalation policy
+#   ├── severity=warning    → Slack #alerts-warning
+#   └── severity=info       → Slack #alerts-info (batched, 5min)
+#
+# Inhibition: if a cluster is down, suppress individual service alerts
+# (avoid alert storms from a single root cause)
+# ═══════════════════════════════════════════════════════════════════════════
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: AlertmanagerConfig
+metadata:
+  name: platform-alerts
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+spec:
+  route:
+    # Default grouping — group by cluster and alertname
+    groupBy: ["cluster", "alertname", "namespace"]
+    groupWait: 30s       # Wait before sending first notification (group accumulation)
+    groupInterval: 5m    # Wait between notifications for same group
+    repeatInterval: 4h   # Re-notify if still firing after this duration
+
+    receiver: default-slack
+
+    routes:
+      # Critical alerts → PagerDuty immediately
+      - matchers:
+          - name: severity
+            value: critical
+            matchType: "="
+        receiver: pagerduty-critical
+        groupWait: 10s    # Critical: shorter wait
+        repeatInterval: 1h
+
+      # Production critical → use prod escalation policy
+      - matchers:
+          - name: severity
+            value: critical
+            matchType: "="
+          - name: environment
+            value: prod
+            matchType: "="
+        receiver: pagerduty-prod
+        groupWait: 0s     # Prod critical: immediate
+
+      # Warning alerts → Slack
+      - matchers:
+          - name: severity
+            value: warning
+            matchType: "="
+        receiver: slack-warnings
+        groupInterval: 10m
+        repeatInterval: 12h
+
+      # Watchdog / DeadManSwitch — heartbeat to confirm alertmanager is alive
+      - matchers:
+          - name: alertname
+            value: Watchdog
+            matchType: "="
+        receiver: deadmansswitch
+        repeatInterval: 1m   # Must fire every minute
+
+  receivers:
+    - name: default-slack
+      slackConfigs:
+        - apiURL:
+            name: alertmanager-slack-secret
+            key: webhook-url
+          channel: "#alerts-platform"
+          sendResolved: true
+          title: "{{ .GroupLabels.alertname }}"
+          text: |
+            {{ range .Alerts }}
+            *Cluster:* {{ .Labels.cluster }}
+            *Namespace:* {{ .Labels.namespace }}
+            *Description:* {{ .Annotations.description }}
+            *Runbook:* {{ .Annotations.runbook_url }}
+            {{ end }}
+
+    - name: slack-warnings
+      slackConfigs:
+        - apiURL:
+            name: alertmanager-slack-secret
+            key: webhook-url
+          channel: "#alerts-warning"
+          sendResolved: true
+          color: "warning"
+
+    - name: pagerduty-critical
+      pagerdutyConfigs:
+        - serviceKey:
+            name: alertmanager-pagerduty-secret
+            key: service-key
+          description: "{{ .GroupLabels.alertname }}: {{ .CommonAnnotations.description }}"
+          details:
+            cluster: "{{ .GroupLabels.cluster }}"
+            namespace: "{{ .GroupLabels.namespace }}"
+            runbook: "{{ .CommonAnnotations.runbook_url }}"
+          severity: critical
+          client: "ArgoCD Platform"
+          clientURL: "https://argocd.internal.example.com"
+
+    - name: pagerduty-prod
+      pagerdutyConfigs:
+        - serviceKey:
+            name: alertmanager-pagerduty-prod-secret
+            key: service-key
+          description: "PROD CRITICAL: {{ .GroupLabels.alertname }}"
+          severity: critical
+
+    - name: deadmansswitch
+      webhookConfigs:
+        - url: "https://deadmansswitch.example.com/ping/YOUR_SWITCH_ID"
+
+  # Inhibition rules — suppress child alerts when parent fires
+  inhibitRules:
+    # If a node is NotReady, suppress pod-level alerts from that node
+    - sourceMatchers:
+        - name: alertname
+          value: KubeNodeNotReady
+          matchType: "="
+      targetMatchers:
+        - name: alertname
+          value: KubePodCrashLooping
+          matchType: "="
+      equal: ["cluster", "node"]
+
+    # If namespace is terminating, suppress deployment alerts
+    - sourceMatchers:
+        - name: alertname
+          value: KubeNamespaceTerminating
+          matchType: "="
+      targetMatchers:
+        - name: namespace
+          matchType: "=~"
+          value: ".+"
+      equal: ["cluster", "namespace"]
+
+---
+# infrastructure/monitoring/recording-rules.yaml
+#
+# Recording rules pre-aggregate expensive queries for dashboards
+# Without these, dashboard load times suffer at scale
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: platform-recording-rules
+  namespace: monitoring
+  labels:
+    release: kube-prometheus-stack
+spec:
+  groups:
+    # ── Golden Signals per service ──────────────────────────────────────────
+    - name: golden-signals
+      interval: 30s
+      rules:
+        # Request rate (traffic)
+        - record: job:http_requests:rate5m
+          expr: |
+            sum by (job, namespace, cluster) (
+              rate(http_requests_total[5m])
+            )
+
+        # Error rate (errors)
+        - record: job:http_errors:rate5m
+          expr: |
+            sum by (job, namespace, cluster) (
+              rate(http_requests_total{status=~"5.."}[5m])
+            )
+
+        # Error ratio
+        - record: job:http_error_ratio:rate5m
+          expr: |
+            job:http_errors:rate5m / job:http_requests:rate5m
+
+        # p99 latency (latency)
+        - record: job:http_latency_p99:rate5m
+          expr: |
+            histogram_quantile(0.99,
+              sum by (job, namespace, cluster, le) (
+                rate(http_request_duration_seconds_bucket[5m])
+              )
+            )
+
+    # ── Resource saturation ─────────────────────────────────────────────────
+    - name: resource-saturation
+      interval: 60s
+      rules:
+        - record: namespace:container_cpu_usage:ratio
+          expr: |
+            sum by (namespace, cluster) (
+              rate(container_cpu_usage_seconds_total{container!=""}[5m])
+            )
+            /
+            sum by (namespace, cluster) (
+              kube_pod_container_resource_limits{resource="cpu"}
+            )
+
+        - record: namespace:container_memory_usage:ratio
+          expr: |
+            sum by (namespace, cluster) (
+              container_memory_working_set_bytes{container!=""}
+            )
+            /
+            sum by (namespace, cluster) (
+              kube_pod_container_resource_limits{resource="memory"}
+            )
+
+    # ── SLO Burn Rate ───────────────────────────────────────────────────────
+    - name: slo-burn-rate
+      interval: 30s
+      rules:
+        # 1h burn rate for error budget
+        - record: job:slo_error_budget_burn:1h
+          expr: |
+            (
+              1 - sum by (job) (rate(http_requests_total{status!~"5.."}[1h]))
+              / sum by (job) (rate(http_requests_total[1h]))
+            )
+            / (1 - 0.999)   # 99.9% SLO target
+
+        # 6h burn rate (fast burn alert)
+        - record: job:slo_error_budget_burn:6h
+          expr: |
+            (
+              1 - sum by (job) (rate(http_requests_total{status!~"5.."}[6h]))
+              / sum by (job) (rate(http_requests_total[6h]))
+            )
+            / (1 - 0.999)
+
+    # ── Platform alerts ─────────────────────────────────────────────────────
+    - name: platform-alerts
+      rules:
+        # ArgoCD sync failures
+        - alert: ArgoCDAppOutOfSync
+          expr: argocd_app_info{sync_status="OutOfSync"} == 1
+          for: 10m
+          labels:
+            severity: warning
+            team: platform
+          annotations:
+            summary: "ArgoCD app {{ $labels.name }} out of sync"
+            description: "App {{ $labels.name }} has been out of sync for > 10 minutes"
+            runbook_url: "https://wiki.internal/runbooks/argocd-out-of-sync"
+
+        - alert: ArgoCDAppUnhealthy
+          expr: argocd_app_info{health_status!="Healthy"} == 1
+          for: 5m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "ArgoCD app {{ $labels.name }} unhealthy"
+            description: "App {{ $labels.name }} health status: {{ $labels.health_status }}"
+            runbook_url: "https://wiki.internal/runbooks/argocd-unhealthy"
+
+        # SLO burn rate alert (fast burn)
+        - alert: SLOBurnRateFast
+          expr: |
+            job:slo_error_budget_burn:1h > 14
+            and
+            job:slo_error_budget_burn:6h > 14
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "High SLO burn rate for {{ $labels.job }}"
+            description: "Burning error budget 14x faster than sustainable rate"
+            runbook_url: "https://wiki.internal/runbooks/slo-burn-rate"

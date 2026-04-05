@@ -1,0 +1,25 @@
+# infrastructure/monitoring/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: monitoring
+
+helmCharts:
+  - name: kube-prometheus-stack
+    repo: https://prometheus-community.github.io/helm-charts
+    version: 58.3.1
+    releaseName: kube-prometheus-stack
+    namespace: monitoring
+    valuesFile: values.yaml
+
+resources:
+  - namespace.yaml
+  - alertmanager-config.yaml
+  - recording-rules.yaml
+  - grafana-dashboards/
+
+---
+# infrastructure/monitoring/values.yaml (referenced above)
+# Key config for kube-prometheus-stack
+
+# Embedded as a separate file in real repo — shown inline for clarity
