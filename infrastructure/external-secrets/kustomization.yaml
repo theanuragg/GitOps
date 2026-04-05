@@ -1,0 +1,53 @@
+# infrastructure/external-secrets/kustomization.yaml
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - cluster-secret-store.yaml
+
+helmCharts:
+  - name: external-secrets
+    repo: https://charts.external-secrets.io
+    version: 0.9.13    # Always pin; never use "*" or "latest"
+    releaseName: external-secrets
+    namespace: external-secrets
+    valuesFile: values.yaml
+
+---
+# infrastructure/external-secrets/values.yaml is referenced above
+# See cluster-secret-store.yaml below for the Vault integration
+
+---
+# infrastructure/external-secrets/cluster-secret-store.yaml
+#
+# ClusterSecretStore — connects External Secrets to Vault
+# This is cluster-scoped (shared by all namespaces)
+# Uses Kubernetes auth: the ESO ServiceAccount is bound to a Vault role
+apiVersion: external-secrets.io/v1beta1
+kind: ClusterSecretStore
+metadata:
+  name: vault-backend
+  labels:
+    app.kubernetes.io/managed-by: argocd
+spec:
+  provider:
+    vault:
+      server: "https://vault.internal.example.com"
+      path: "secret"    # KV v2 mount path
+      version: "v2"
+
+      # Vault CA certificate for TLS verification
+      caBundle: |-
+        -----BEGIN CERTIFICATE-----
+        # Replace with your Vault CA cert (base64 encoded)
+        # Get it from: vault read pki/cert/ca
+        -----END CERTIFICATE-----
+
+      # Kubernetes auth: ESO SA presents its JWT token to Vault
+      auth:
+        kubernetes:
+          mountPath: "kubernetes"
+          role: "external-secrets"   # Vault role configured in Vault terraform
+          serviceAccountRef:
+            name: external-secrets
+            namespace: external-secrets
