@@ -1,0 +1,61 @@
+# bootstrap/argocd/root-app.yaml
+#
+# ROOT APP-OF-APPS
+# ═══════════════════════════════════════════════════════════════════════════
+# This is the single manifest applied manually (once) during bootstrap.
+# After this, ArgoCD manages EVERYTHING else — including itself.
+#
+# Pattern: This app watches the 'clusters/' directory in this repo.
+# Each subdirectory (dev, staging, prod, management) becomes an ArgoCD App
+# via the ApplicationSet in cluster-appset.yaml.
+#
+# Sync order:
+#   1. AppProjects    (RBAC)
+#   2. Infrastructure (cert-manager, external-secrets, ingress, monitoring)
+#   3. Applications   (workloads)
+#
+# The sync-wave annotations on child apps enforce this ordering.
+# ═══════════════════════════════════════════════════════════════════════════
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: root
+  namespace: argocd
+  labels:
+    app.kubernetes.io/managed-by: bootstrap
+    tier: root
+  annotations:
+    # This app is self-managed — ArgoCD tracks its own config
+    argocd.argoproj.io/sync-wave: "-100"
+  # Prevent accidental deletion of the root app
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: platform
+
+  source:
+    repoURL: https://github.com/YOUR_ORG/gitops-multicluster
+    targetRevision: main
+    path: bootstrap/clusters   # Contains cluster-appset.yaml and project-appset.yaml
+
+  destination:
+    server: https://kubernetes.default.svc  # management cluster (in-cluster)
+    namespace: argocd
+
+  syncPolicy:
+    automated:
+      prune: true      # Remove resources deleted from Git
+      selfHeal: true   # Revert manual kubectl changes
+      allowEmpty: false
+    syncOptions:
+      - CreateNamespace=true
+      - PrunePropagationPolicy=foreground  # Wait for children before pruning parent
+      - PruneLast=true                      # Prune only after all syncs succeed
+      - ApplyOutOfSyncOnly=true             # Skip resources already in sync (perf)
+      - ServerSideApply=true               # Required for large CRDs (Prometheus, etc.)
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m

@@ -1,0 +1,279 @@
+# bootstrap/argocd/values.yaml
+# Production-grade ArgoCD Helm values
+# Ref: https://github.com/argoproj/argo-helm/blob/main/charts/argo-cd/values.yaml
+#
+# Design decisions:
+#   - HA mode: 2 replicas for server, repo-server, application-controller
+#   - Redis HA via redis-ha sub-chart (sentinel mode)
+#   - OIDC via GitHub OAuth (no local users except break-glass admin)
+#   - Metrics exposed for Prometheus scraping
+#   - Resource limits sized for managing 3 clusters × 20 apps
+
+global:
+  # Use a specific image digest in prod to prevent supply chain attacks
+  image:
+    tag: "v2.10.5"
+  # Pod security standards
+  securityContext:
+    runAsNonRoot: true
+    runAsUser: 999
+    fsGroup: 999
+
+# ── ArgoCD Server ─────────────────────────────────────────────────────────────
+server:
+  replicas: 2
+
+  # Disable insecure — terminate TLS at the ingress
+  extraArgs:
+    - --insecure
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+
+  # Horizontal pod autoscaling
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 5
+    targetCPUUtilizationPercentage: 70
+
+  ingress:
+    enabled: true
+    ingressClassName: nginx
+    annotations:
+      cert-manager.io/cluster-issuer: letsencrypt-prod
+      nginx.ingress.kubernetes.io/ssl-redirect: "true"
+      nginx.ingress.kubernetes.io/backend-protocol: "HTTP"
+      # Rate limit the UI to prevent brute force on local accounts
+      nginx.ingress.kubernetes.io/limit-rps: "20"
+    hosts:
+      - argocd.internal.example.com
+    tls:
+      - secretName: argocd-tls
+        hosts:
+          - argocd.internal.example.com
+
+  # OIDC via GitHub OAuth — no local login except break-glass admin
+  config:
+    # Disable admin account in normal operations
+    # Enable only by setting the secret manually during incidents
+    admin.enabled: "false"
+
+    # OIDC: GitHub OAuth App
+    oidc.config: |
+      name: GitHub
+      issuer: https://token.actions.githubusercontent.com
+      clientID: $oidc.github.clientID
+      clientSecret: $oidc.github.clientSecret
+      requestedScopes:
+        - openid
+        - profile
+        - email
+        - read:org
+      requestedIDTokenClaims:
+        groups:
+          essential: true
+
+    # Resource tracking: annotation-based (less RBAC noise than label)
+    application.resourceTrackingMethod: annotation
+
+    # Health check overrides for custom CRDs
+    resource.customizations.health.argoproj.io_Rollout: |
+      hs = {}
+      if obj.status ~= nil then
+        if obj.status.phase == "Degraded" then
+          hs.status = "Degraded"
+          hs.message = obj.status.message
+          return hs
+        end
+        if obj.status.phase == "Paused" then
+          hs.status = "Suspended"
+          hs.message = "Rollout is paused"
+          return hs
+        end
+        if obj.status.readyReplicas == obj.spec.replicas then
+          hs.status = "Healthy"
+          return hs
+        end
+      end
+      hs.status = "Progressing"
+      hs.message = "Waiting for rollout to complete"
+      return hs
+
+    # Ignore differences for fields managed by other controllers
+    resource.customizations.ignoreDifferences.admissionregistration.k8s.io_MutatingWebhookConfiguration: |
+      jqPathExpressions:
+        - '.webhooks[]?.clientConfig.caBundle'
+
+  # RBAC — maps GitHub teams to ArgoCD roles
+  rbacConfig:
+    policy.default: role:readonly
+    policy.csv: |
+      # Platform team: full access to all projects
+      p, role:platform-admin, applications, *, */*, allow
+      p, role:platform-admin, clusters, *, *, allow
+      p, role:platform-admin, repositories, *, *, allow
+      p, role:platform-admin, accounts, *, *, allow
+      p, role:platform-admin, projects, *, *, allow
+
+      # Dev team: deploy to dev only, readonly elsewhere
+      p, role:dev-team, applications, get, */*, allow
+      p, role:dev-team, applications, sync, dev/*, allow
+      p, role:dev-team, applications, delete, dev/*, deny
+
+      # SRE team: can sync prod but not delete
+      p, role:sre-team, applications, *, */*, allow
+      p, role:sre-team, applications, delete, prod/*, deny
+
+      # GitHub team → ArgoCD role mappings
+      g, YOUR_ORG:platform, role:platform-admin
+      g, YOUR_ORG:developers, role:dev-team
+      g, YOUR_ORG:sre, role:sre-team
+
+    scopes: '[groups, email]'
+
+  metrics:
+    enabled: true
+    serviceMonitor:
+      enabled: true
+      namespace: monitoring
+
+# ── Application Controller ────────────────────────────────────────────────────
+controller:
+  replicas: 1   # Stateful; sharding available but 1 is fine for 3 clusters
+
+  resources:
+    requests:
+      cpu: 250m
+      memory: 512Mi
+    limits:
+      cpu: 1000m
+      memory: 2Gi
+
+  # Tune sync performance for multi-cluster
+  env:
+    - name: ARGOCD_APPLICATION_CONTROLLER_REPO_SERVER_TIMEOUT_SECONDS
+      value: "120"
+    - name: ARGOCD_APPLICATION_CONTROLLER_STATUS_PROCESSORS
+      value: "20"
+    - name: ARGOCD_APPLICATION_CONTROLLER_OPERATION_PROCESSORS
+      value: "10"
+
+  metrics:
+    enabled: true
+    serviceMonitor:
+      enabled: true
+      namespace: monitoring
+
+# ── Repo Server ───────────────────────────────────────────────────────────────
+repoServer:
+  replicas: 2
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 1Gi
+
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 4
+    targetCPUUtilizationPercentage: 75
+
+  # Mount Vault agent sidecar for secret injection
+  volumes:
+    - name: vault-token
+      emptyDir:
+        medium: Memory
+
+  metrics:
+    enabled: true
+    serviceMonitor:
+      enabled: true
+      namespace: monitoring
+
+# ── ApplicationSet Controller ─────────────────────────────────────────────────
+applicationSet:
+  replicas: 2
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: 250m
+      memory: 256Mi
+  metrics:
+    enabled: true
+    serviceMonitor:
+      enabled: true
+      namespace: monitoring
+
+# ── Redis (HA via sentinel) ───────────────────────────────────────────────────
+redis-ha:
+  enabled: true
+  replicas: 3
+  redis:
+    resources:
+      requests:
+        cpu: 50m
+        memory: 64Mi
+      limits:
+        cpu: 200m
+        memory: 128Mi
+
+# ── Notifications ─────────────────────────────────────────────────────────────
+notifications:
+  enabled: true
+
+  # Notify Slack on sync failures and production deployments
+  notifiers:
+    service.slack: |
+      token: $slack-token
+
+  triggers:
+    trigger.on-sync-failed: |
+      - when: app.status.operationState.phase in ['Error', 'Failed']
+        send: [app-sync-failed]
+    trigger.on-deployed: |
+      - when: app.status.operationState.phase in ['Succeeded'] and app.metadata.labels['environment'] == 'prod'
+        send: [app-deployed-prod]
+
+  templates:
+    template.app-sync-failed: |
+      slack:
+        attachments: |
+          [{
+            "color": "#E53E3E",
+            "title": "🚨 Sync Failed: {{.app.metadata.name}}",
+            "fields": [
+              {"title": "Cluster", "value": "{{.app.spec.destination.name}}", "short": true},
+              {"title": "Namespace", "value": "{{.app.spec.destination.namespace}}", "short": true},
+              {"title": "Error", "value": "{{.app.status.operationState.message}}"}
+            ]
+          }]
+    template.app-deployed-prod: |
+      slack:
+        attachments: |
+          [{
+            "color": "#48BB78",
+            "title": "✅ Production Deploy: {{.app.metadata.name}}",
+            "fields": [
+              {"title": "Revision", "value": "{{.app.status.sync.revision}}", "short": true},
+              {"title": "Author", "value": "{{(call .repo.GetCommitMetadata .app.status.sync.revision).Author}}", "short": true}
+            ]
+          }]
+
+  subscriptions:
+    - recipients:
+        - slack:deployments
+      triggers:
+        - on-sync-failed
+        - on-deployed
