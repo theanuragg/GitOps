@@ -1,0 +1,235 @@
+# projects/appprojects.yaml
+#
+# ARGOCD APPPROJECTS — Security Boundaries Between Environments
+# ═══════════════════════════════════════════════════════════════════════════
+# AppProjects enforce:
+#   1. Which repos can be deployed (source whitelist)
+#   2. Which clusters/namespaces can be targeted (destination whitelist)
+#   3. Which Kubernetes resource types are allowed (resource whitelist)
+#   4. Which users/groups have access (role bindings)
+#
+# Without AppProjects, any ArgoCD user could deploy to any cluster.
+# With them, dev team cannot accidentally (or maliciously) push to prod.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ── Platform Project (management cluster only) ────────────────────────────────
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: platform
+  namespace: argocd
+  labels:
+    tier: project
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  description: "Platform team project — manages ArgoCD itself and cross-cluster infra"
+
+  # Only our internal git repo
+  sourceRepos:
+    - https://github.com/YOUR_ORG/gitops-multicluster
+    # Allow Helm chart repos for infra components
+    - https://argoproj.github.io/argo-helm
+    - https://charts.cert-manager.io
+    - https://kubernetes.github.io/ingress-nginx
+    - https://prometheus-community.github.io/helm-charts
+    - https://helm.releases.hashicorp.com
+
+  destinations:
+    # Platform project can target ANY cluster — required for managing all envs
+    - server: "*"
+      namespace: "*"
+
+  # Resource whitelist: platform can manage cluster-scoped resources
+  clusterResourceWhitelist:
+    - group: "*"
+      kind: "*"
+
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"
+
+  # Orphaned resource monitoring — alert if resources exist outside of ArgoCD management
+  orphanedResources:
+    warn: true
+
+  roles:
+    - name: admin
+      description: "Full platform admin access"
+      policies:
+        - p, proj:platform:admin, applications, *, platform/*, allow
+      groups:
+        - YOUR_ORG:platform
+
+---
+# ── Dev Project ───────────────────────────────────────────────────────────────
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: dev
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  description: "Development environment — fast iteration, lower restrictions"
+
+  sourceRepos:
+    - https://github.com/YOUR_ORG/gitops-multicluster
+    - https://github.com/YOUR_ORG/*   # Allow feature branches from org repos
+
+  destinations:
+    # Dev project can ONLY target the dev cluster
+    - server: https://dev-cluster.internal.example.com
+      namespace: "*"
+    # Deny targeting other clusters (implicit — anything not listed is denied)
+
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+    - group: "rbac.authorization.k8s.io"
+      kind: ClusterRole
+    - group: "rbac.authorization.k8s.io"
+      kind: ClusterRoleBinding
+
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"
+
+  # Sync windows: dev can sync anytime
+  syncWindows: []
+
+  orphanedResources:
+    warn: true
+    ignore:
+      - group: "apps"
+        kind: ReplicaSet
+        name: "*"
+
+  roles:
+    - name: deployer
+      description: "Dev team — can sync but not delete"
+      policies:
+        - p, proj:dev:deployer, applications, get, dev/*, allow
+        - p, proj:dev:deployer, applications, sync, dev/*, allow
+        - p, proj:dev:deployer, applications, override, dev/*, allow
+      groups:
+        - YOUR_ORG:developers
+
+---
+# ── Staging Project ───────────────────────────────────────────────────────────
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: staging
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  description: "Staging environment — pre-prod validation, mirrors prod config"
+
+  sourceRepos:
+    - https://github.com/YOUR_ORG/gitops-multicluster
+
+  destinations:
+    - server: https://staging-cluster.internal.example.com
+      namespace: "*"
+
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+    - group: "rbac.authorization.k8s.io"
+      kind: ClusterRole
+    - group: "rbac.authorization.k8s.io"
+      kind: ClusterRoleBinding
+
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"
+
+  # Sync windows: staging can sync 24/7 but only from main branch (enforced in CI)
+  syncWindows: []
+
+  orphanedResources:
+    warn: true
+
+  roles:
+    - name: deployer
+      description: "SRE and senior devs can deploy to staging"
+      policies:
+        - p, proj:staging:deployer, applications, *, staging/*, allow
+      groups:
+        - YOUR_ORG:sre
+        - YOUR_ORG:senior-developers
+
+---
+# ── Production Project ────────────────────────────────────────────────────────
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: prod
+  namespace: argocd
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  description: "Production environment — change-controlled, restricted sync windows"
+
+  sourceRepos:
+    # Prod: only from the primary repo, only tagged commits (enforced via CI policy)
+    - https://github.com/YOUR_ORG/gitops-multicluster
+
+  destinations:
+    - server: https://prod-cluster.internal.example.com
+      namespace: "*"
+
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+    - group: "rbac.authorization.k8s.io"
+      kind: ClusterRole
+    - group: "rbac.authorization.k8s.io"
+      kind: ClusterRoleBinding
+    - group: "networking.k8s.io"
+      kind: IngressClass
+
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"
+
+  # PRODUCTION SYNC WINDOWS:
+  # Automated syncs only during business hours on weekdays.
+  # Emergency syncs can be triggered manually outside these windows.
+  syncWindows:
+    # Allow: weekdays 9am-6pm UTC
+    - kind: allow
+      schedule: "0 9 * * 1-5"
+      duration: 9h
+      applications: ["*"]
+      manualSync: true   # Always allow manual sync regardless of window
+
+    # Deny: Friday 3pm onwards (prevent Friday deploys)
+    - kind: deny
+      schedule: "0 15 * * 5"
+      duration: 66h   # Friday 3pm → Monday 9am
+      applications: ["*"]
+      manualSync: false
+
+  orphanedResources:
+    warn: true
+
+  roles:
+    - name: deployer
+      description: "SRE only — can sync but not delete prod resources"
+      policies:
+        - p, proj:prod:deployer, applications, get, prod/*, allow
+        - p, proj:prod:deployer, applications, sync, prod/*, allow
+        - p, proj:prod:deployer, applications, override, prod/*, allow
+        - p, proj:prod:deployer, applications, delete, prod/*, deny
+      groups:
+        - YOUR_ORG:sre
+
+    - name: readonly
+      description: "All engineers can view prod"
+      policies:
+        - p, proj:prod:readonly, applications, get, prod/*, allow
+      groups:
+        - YOUR_ORG:developers
