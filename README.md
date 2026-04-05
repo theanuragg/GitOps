@@ -33,7 +33,7 @@ ProdInfra["infra"]
 ManagementCluster --> ArgoCD
 ManagementCluster --> ImageUpdater
 ManagementCluster --> AppSet
-ManagementCluster -->|GitOps Sync (pull-based)| GitRepo
+ManagementCluster -->|"GitOps Sync (pull-based)"| GitRepo
 GitRepo -->|Contains| Clusters
 GitRepo --> Apps
 GitRepo --> Infra
