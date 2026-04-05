@@ -8,28 +8,48 @@
 
 ```mermaid
 flowchart TD
-subgraph ManagementCluster[MANAGEMENT CLUSTER]
-  ArgoCD[ArgoCD (control)]
-  ImageUpdater[ArgoCD Image Updater]
-  AppSet[ApplicationSet Controller]
-end
-ManagementCluster -->|GitOps Sync (pull-based)| GitRepo[Git Repository (Single Source of Truth)]
-GitRepo -->|Contains| Clusters[clusters/]
-GitRepo --> Apps[apps/]
-GitRepo --> Infra[infrastructure/]
-GitRepo --> Policies[policies/]
-Clusters --> DevCluster[DEV CLUSTER]
-Clusters --> StagingCluster[STAGING CLUSTER]
-Clusters --> ProdCluster[PROD CLUSTER]
-DevCluster -->|app-dev| DevApp[app-dev]
-DevCluster -->|monitoring| DevMon[monitoring]
-DevCluster -->|infra| DevInfra[infra]
-StagingCluster -->|app-staging| StagingApp[app-staging]
-StagingCluster -->|monitoring| StagingMon[monitoring]
-StagingCluster -->|infra| StagingInfra[infra]
-ProdCluster -->|app-prod| ProdApp[app-prod]
-ProdCluster -->|monitoring| ProdMon[monitoring]
-ProdCluster -->|infra| ProdInfra[infra]
+ManagementCluster[MANAGEMENT CLUSTER]
+ArgoCD[ArgoCD (control)]
+ImageUpdater[ArgoCD Image Updater]
+AppSet[ApplicationSet Controller]
+GitRepo[Git Repository (Single Source of Truth)]
+Clusters[clusters/]
+Apps[apps/]
+Infra[infrastructure/]
+Policies[policies/]
+DevCluster[DEV CLUSTER]
+StagingCluster[STAGING CLUSTER]
+ProdCluster[PROD CLUSTER]
+DevApp[app-dev]
+DevMon[monitoring]
+DevInfra[infra]
+StagingApp[app-staging]
+StagingMon[monitoring]
+StagingInfra[infra]
+ProdApp[app-prod]
+ProdMon[monitoring]
+ProdInfra[infra]
+
+ManagementCluster --> ArgoCD
+ManagementCluster --> ImageUpdater
+ManagementCluster --> AppSet
+ManagementCluster -->|GitOps Sync (pull-based)| GitRepo
+GitRepo -->|Contains| Clusters
+GitRepo --> Apps
+GitRepo --> Infra
+GitRepo --> Policies
+Clusters --> DevCluster
+Clusters --> StagingCluster
+Clusters --> ProdCluster
+DevCluster -->|app-dev| DevApp
+DevCluster -->|monitoring| DevMon
+DevCluster -->|infra| DevInfra
+StagingCluster -->|app-staging| StagingApp
+StagingCluster -->|monitoring| StagingMon
+StagingCluster -->|infra| StagingInfra
+ProdCluster -->|app-prod| ProdApp
+ProdCluster -->|monitoring| ProdMon
+ProdCluster -->|infra| ProdInfra
 ```
 
 ---
