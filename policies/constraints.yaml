@@ -1,0 +1,269 @@
+# policies/require-resource-limits.yaml
+#
+# OPA GATEKEEPER POLICIES — Enforce Standards Before They Reach Clusters
+# ═══════════════════════════════════════════════════════════════════════════
+# These policies run as admission webhooks on ALL clusters.
+# They block non-compliant manifests at the API server before they apply.
+#
+# ArgoCD respects these constraints — if a manifest violates policy,
+# the sync fails with a clear error message, not a cryptic runtime failure.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# ── ConstraintTemplate: Require Resource Limits ───────────────────────────────
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: requireresourcelimits
+  annotations:
+    description: "Requires all containers to have CPU and memory limits set"
+spec:
+  crd:
+    spec:
+      names:
+        kind: RequireResourceLimits
+      validation:
+        openAPIV3Schema:
+          properties:
+            exemptImages:
+              type: array
+              items:
+                type: string
+
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package requireresourcelimits
+
+        violation[{"msg": msg, "details": details}] {
+          container := input.review.object.spec.containers[_]
+          not container_exempt(container)
+          not has_limits(container)
+          msg := sprintf(
+            "Container '%v' in pod '%v' must have CPU and memory limits set",
+            [container.name, input.review.object.metadata.name]
+          )
+          details := {"container": container.name}
+        }
+
+        # Also check init containers
+        violation[{"msg": msg, "details": details}] {
+          container := input.review.object.spec.initContainers[_]
+          not container_exempt(container)
+          not has_limits(container)
+          msg := sprintf(
+            "Init container '%v' must have CPU and memory limits set",
+            [container.name]
+          )
+          details := {"container": container.name}
+        }
+
+        has_limits(container) {
+          container.resources.limits.cpu
+          container.resources.limits.memory
+        }
+
+        container_exempt(container) {
+          exemptImages := input.parameters.exemptImages
+          image := exemptImages[_]
+          startswith(container.image, image)
+        }
+
+---
+# Constraint: Enforce the ConstraintTemplate on all pods
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: RequireResourceLimits
+metadata:
+  name: require-resource-limits
+spec:
+  enforcementAction: deny   # "deny" blocks; "warn" allows but alerts; "dryrun" for testing
+
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+      - apiGroups: ["apps"]
+        kinds: ["Deployment", "StatefulSet", "DaemonSet"]
+
+    # Exempt system namespaces
+    excludedNamespaces:
+      - kube-system
+      - kube-public
+      - kube-node-lease
+      - argocd
+      - cert-manager
+      - external-secrets
+      - ingress-nginx
+      - monitoring
+
+  parameters:
+    exemptImages:
+      - "k8s.gcr.io/"    # System images
+      - "registry.k8s.io/"
+
+---
+# ── ConstraintTemplate: No Latest Tag ────────────────────────────────────────
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: nolatesttag
+  annotations:
+    description: "Blocks :latest image tags in production workloads"
+spec:
+  crd:
+    spec:
+      names:
+        kind: NoLatestTag
+
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package nolatesttag
+
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.containers[_]
+          has_latest_tag(container.image)
+          msg := sprintf(
+            "Container '%v' uses ':latest' or untagged image '%v'. Pin to a specific digest or semver tag.",
+            [container.name, container.image]
+          )
+        }
+
+        has_latest_tag(image) {
+          endswith(image, ":latest")
+        }
+
+        has_latest_tag(image) {
+          not contains(image, ":")
+        }
+
+---
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: NoLatestTag
+metadata:
+  name: no-latest-tag-prod
+spec:
+  enforcementAction: deny
+  match:
+    kinds:
+      - apiGroups: ["apps"]
+        kinds: ["Deployment", "StatefulSet"]
+    # Only enforce in production (use warn in dev/staging)
+    namespaceSelector:
+      matchLabels:
+        environment: prod
+    excludedNamespaces:
+      - kube-system
+      - argocd
+
+---
+# ── ConstraintTemplate: Require Non-Root ─────────────────────────────────────
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: requirenonroot
+spec:
+  crd:
+    spec:
+      names:
+        kind: RequireNonRoot
+
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package requirenonroot
+
+        violation[{"msg": msg}] {
+          container := input.review.object.spec.containers[_]
+          not nonroot(container)
+          msg := sprintf(
+            "Container '%v' must set runAsNonRoot: true or runAsUser > 0",
+            [container.name]
+          )
+        }
+
+        nonroot(container) {
+          container.securityContext.runAsNonRoot == true
+        }
+
+        nonroot(container) {
+          container.securityContext.runAsUser > 0
+        }
+
+        nonroot(container) {
+          # Inherit from pod-level security context
+          input.review.object.spec.securityContext.runAsNonRoot == true
+        }
+
+---
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: RequireNonRoot
+metadata:
+  name: require-non-root
+spec:
+  enforcementAction: deny
+  match:
+    kinds:
+      - apiGroups: [""]
+        kinds: ["Pod"]
+      - apiGroups: ["apps"]
+        kinds: ["Deployment", "StatefulSet", "DaemonSet"]
+    excludedNamespaces:
+      - kube-system
+      - kube-public
+      - monitoring   # Some monitoring agents run as root
+
+---
+# ── ConstraintTemplate: Require Labels ───────────────────────────────────────
+apiVersion: templates.gatekeeper.sh/v1
+kind: ConstraintTemplate
+metadata:
+  name: requirelabels
+spec:
+  crd:
+    spec:
+      names:
+        kind: RequireLabels
+      validation:
+        openAPIV3Schema:
+          properties:
+            labels:
+              type: array
+              items:
+                type: string
+
+  targets:
+    - target: admission.k8s.gatekeeper.sh
+      rego: |
+        package requirelabels
+
+        violation[{"msg": msg}] {
+          required := input.parameters.labels[_]
+          not input.review.object.metadata.labels[required]
+          msg := sprintf(
+            "Resource '%v/%v' missing required label: '%v'",
+            [
+              input.review.object.kind,
+              input.review.object.metadata.name,
+              required
+            ]
+          )
+        }
+
+---
+apiVersion: constraints.gatekeeper.sh/v1beta1
+kind: RequireLabels
+metadata:
+  name: require-app-labels
+spec:
+  enforcementAction: deny
+  match:
+    kinds:
+      - apiGroups: ["apps"]
+        kinds: ["Deployment", "StatefulSet"]
+    excludedNamespaces:
+      - kube-system
+  parameters:
+    labels:
+      - "app.kubernetes.io/name"
+      - "app.kubernetes.io/managed-by"
+      - "environment"
