@@ -1,0 +1,234 @@
+# bootstrap/clusters/cluster-appset.yaml
+#
+# CLUSTER APPLICATION SET
+# ═══════════════════════════════════════════════════════════════════════════
+# This ApplicationSet uses the CLUSTER GENERATOR to create one ArgoCD
+# Application per registered cluster. It automatically detects new clusters
+# added via register-cluster.sh without requiring manual App creation.
+#
+# How it works:
+#   1. ArgoCD watches all registered clusters for label: managed-by=argocd
+#   2. For each matching cluster, it renders a new Application
+#   3. That Application points to clusters/<cluster-name>/kustomization.yaml
+#   4. Which in turn references infra + app overlays for that environment
+#
+# To onboard a new cluster: register it → commit cluster dir → done.
+# ═══════════════════════════════════════════════════════════════════════════
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: clusters
+  namespace: argocd
+  labels:
+    tier: platform
+spec:
+  # ── Generators ──────────────────────────────────────────────────────────
+  generators:
+    # Cluster generator: one app per registered ArgoCD cluster
+    - clusters:
+        selector:
+          matchLabels:
+            managed-by: argocd
+        values:
+          # These values are available as {{ values.X }} in the template
+          repoURL: https://github.com/YOUR_ORG/gitops-multicluster
+          targetRevision: main
+
+  # ── Sync Policy (applied to all generated apps) ──────────────────────────
+  syncPolicy:
+    # Preserve ApplicationSet-managed apps (don't delete if generator stops matching)
+    preserveResourcesOnDeletion: false
+
+  # ── Application Template ─────────────────────────────────────────────────
+  template:
+    metadata:
+      # App name = cluster name (e.g., "cluster-dev", "cluster-prod")
+      name: "cluster-{{name}}"
+      namespace: argocd
+      labels:
+        environment: "{{metadata.labels.environment}}"
+        managed-by: applicationset
+        tier: cluster-root
+      annotations:
+        # Cluster-level apps sync before application-level apps (wave -50)
+        argocd.argoproj.io/sync-wave: "-50"
+      finalizers:
+        - resources-finalizer.argocd.argoproj.io
+
+    spec:
+      # Put each cluster's app in the matching AppProject
+      project: "{{metadata.labels.environment}}"
+
+      source:
+        repoURL: "{{values.repoURL}}"
+        targetRevision: "{{values.targetRevision}}"
+        # This path maps to: clusters/dev/, clusters/staging/, clusters/prod/
+        path: "clusters/{{name}}"
+
+      destination:
+        # Deploy the cluster-level apps to the target cluster itself
+        server: "{{server}}"
+        namespace: argocd
+
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+          allowEmpty: false
+        syncOptions:
+          - CreateNamespace=true
+          - ServerSideApply=true
+          - ApplyOutOfSyncOnly=true
+          - PruneLast=true
+        retry:
+          limit: 3
+          backoff:
+            duration: 10s
+            factor: 2
+            maxDuration: 5m
+
+---
+# ── Infrastructure ApplicationSet ──────────────────────────────────────────
+# Deploys platform infra (cert-manager, monitoring, etc.) to all clusters
+# Uses a MATRIX generator: cluster × component
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: infrastructure
+  namespace: argocd
+  labels:
+    tier: infrastructure
+spec:
+  generators:
+    - matrix:
+        generators:
+          # All registered clusters
+          - clusters:
+              selector:
+                matchLabels:
+                  managed-by: argocd
+          # All infrastructure components
+          - list:
+              elements:
+                - component: cert-manager
+                  syncWave: "-40"
+                - component: external-secrets
+                  syncWave: "-35"
+                - component: ingress-nginx
+                  syncWave: "-30"
+                - component: monitoring
+                  syncWave: "-20"
+
+  template:
+    metadata:
+      name: "infra-{{name}}-{{component}}"
+      namespace: argocd
+      labels:
+        environment: "{{metadata.labels.environment}}"
+        component: "{{component}}"
+        tier: infrastructure
+      annotations:
+        argocd.argoproj.io/sync-wave: "{{syncWave}}"
+      finalizers:
+        - resources-finalizer.argocd.argoproj.io
+
+    spec:
+      project: platform
+
+      source:
+        repoURL: https://github.com/YOUR_ORG/gitops-multicluster
+        targetRevision: main
+        path: "infrastructure/{{component}}"
+        kustomize:
+          # Inject the environment so components can patch per-env
+          commonLabels:
+            environment: "{{metadata.labels.environment}}"
+          namePrefix: ""
+
+      destination:
+        server: "{{server}}"
+        namespace: "{{component}}"
+
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+          - ServerSideApply=true
+          - RespectIgnoreDifferences=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 15s
+            factor: 2
+            maxDuration: 10m
+
+---
+# ── Application ApplicationSet ─────────────────────────────────────────────
+# Uses GIT GENERATOR — discovers apps by scanning apps/overlays/<env>/*/
+# Adding a new app = create apps/overlays/dev/my-app/ directory
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: applications
+  namespace: argocd
+  labels:
+    tier: applications
+spec:
+  generators:
+    - matrix:
+        generators:
+          # Cluster generator for registered clusters
+          - clusters:
+              selector:
+                matchLabels:
+                  managed-by: argocd
+          # Git generator scans the overlay directory for each cluster environment
+          - git:
+              repoURL: https://github.com/YOUR_ORG/gitops-multicluster
+              revision: main
+              directories:
+                - path: "apps/overlays/{{metadata.labels.environment}}/*"
+
+  template:
+    metadata:
+      # Extract app name from the last path segment
+      name: "{{path.basename}}-{{metadata.labels.environment}}"
+      namespace: argocd
+      labels:
+        app-name: "{{path.basename}}"
+        environment: "{{metadata.labels.environment}}"
+        tier: application
+      annotations:
+        argocd.argoproj.io/sync-wave: "0"
+      finalizers:
+        - resources-finalizer.argocd.argoproj.io
+
+    spec:
+      project: "{{metadata.labels.environment}}"
+
+      source:
+        repoURL: https://github.com/YOUR_ORG/gitops-multicluster
+        targetRevision: main
+        path: "{{path}}"
+
+      destination:
+        server: "{{server}}"
+        # Namespace comes from the app's kustomization.yaml
+        namespace: "{{path.basename}}"
+
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+          - ServerSideApply=true
+          - ApplyOutOfSyncOnly=true
+        retry:
+          limit: 3
+          backoff:
+            duration: 10s
+            factor: 2
+            maxDuration: 3m
