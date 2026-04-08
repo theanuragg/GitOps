@@ -14,17 +14,8 @@
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
-# All resources that make up our example "api-service" application
 resources:
-  - namespace.yaml
-  - serviceaccount.yaml
-  - deployment.yaml
-  - service.yaml
-  - hpa.yaml
-  - pdb.yaml
-  - networkpolicy.yaml
-  - externalsecret.yaml
-  - servicemonitor.yaml
+  - manifests.yaml
 
 # Common labels applied to ALL resources in this base
 commonLabels:
