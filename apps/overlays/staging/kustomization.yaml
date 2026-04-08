@@ -1,0 +1,55 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: api-service
+
+resources:
+  - ../../base
+
+commonLabels:
+  environment: staging
+
+commonAnnotations:
+  app.kubernetes.io/environment: staging
+
+patches:
+  - target:
+      kind: Deployment
+      name: api-service
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 2
+      - op: replace
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+
+  - target:
+      kind: HorizontalPodAutoscaler
+      name: api-service
+    patch: |-
+      - op: replace
+        path: /spec/maxReplicas
+        value: 10
+      - op: replace
+        path: /spec/minReplicas
+        value: 2
+
+configMapGenerator:
+  - name: api-service-config
+    literals:
+      - APP_ENV=staging
+      - LOG_LEVEL=info
+      - LOG_FORMAT=json
+      - ENABLE_PPROF=true
+      - CACHE_TTL=120s
+      - DB_MAX_CONNECTIONS=25
+      - DB_MAX_IDLE_CONNECTIONS=5
+    options:
+      disableNameSuffixHash: true
