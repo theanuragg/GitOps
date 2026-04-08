@@ -1,0 +1,44 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: api-service
+
+resources:
+  - ../../base
+
+commonLabels:
+  environment: dev
+
+commonAnnotations:
+  app.kubernetes.io/environment: dev
+
+patches:
+  - target:
+      kind: Deployment
+      name: api-service
+    patch: |-
+      - op: replace
+        path: /spec/replicas
+        value: 1
+      - op: replace
+        path: /spec/template/spec/containers/0/resources
+        value:
+          requests:
+            cpu: 50m
+            memory: 128Mi
+          limits:
+            cpu: 250m
+            memory: 256Mi
+
+configMapGenerator:
+  - name: api-service-config
+    literals:
+      - APP_ENV=development
+      - LOG_LEVEL=debug
+      - LOG_FORMAT=text
+      - ENABLE_PPROF=true
+      - CACHE_TTL=60s
+      - DB_MAX_CONNECTIONS=10
+      - DB_MAX_IDLE_CONNECTIONS=2
+    options:
+      disableNameSuffixHash: true
