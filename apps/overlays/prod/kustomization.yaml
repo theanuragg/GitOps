@@ -14,9 +14,10 @@ kind: Kustomization
 
 namespace: api-service
 
-# Inherit everything from the base
-bases:
+resources:
   - ../../base
+  - ingress.yaml
+  - rollout.yaml
 
 # Pin the production image tag
 # ArgoCD Image Updater will commit updates to this field
@@ -98,10 +99,7 @@ patches:
         path: /metadata/labels/pod-security.kubernetes.io~1warn
         value: restricted
 
-# Additional prod-only resources
-resources:
-  - ingress.yaml
-  - rollout.yaml      # Argo Rollouts for canary deployments in prod
+
 
 # ConfigMap with prod-specific config (non-secret values only)
 configMapGenerator:
